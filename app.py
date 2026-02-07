@@ -10,7 +10,7 @@ from supabase import create_client
 import fusion_api as fs  # <- modulul tău existent cu login / get_plants / kpi etc.
 
 FS_TZ = ZoneInfo("Europe/Bucharest")
-FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia"]
+FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia","aldgate"]
 
 
 def _now_local_str() -> str:
@@ -376,7 +376,6 @@ def render_api_verification_page():
     st.session_state.setdefault("fs_refresh_cooldown_until", 0.0)
 
     st.title(title)
-    st.caption("Refresh: citește RT din FusionSolar, salvează snapshot în Supabase, afișează tabel + grafic (Supabase).")
 
     c1, c2, _ = st.columns([1, 1, 6])
     refresh = c1.button("Refresh")
@@ -421,7 +420,7 @@ def render_api_verification_page():
     st.info(f"Ultimul refresh: {st.session_state.get('fs_last_refresh', '-')}")
 
     if df is None or df.empty:
-        st.warning("Nu există date în tabel. Apasă Refresh.")
+        st.warning("Click refresh.")
     else:
         df_sum = df.copy()
         df_sum["Putere_RT_kW"] = pd.to_numeric(df_sum["Putere_RT_kW"], errors="coerce")
@@ -450,26 +449,37 @@ def render_api_verification_page():
         )
 
     st.divider()
-    st.title("Grafic (ultimele 24h din Supabase)")
+    st.title("Grafic ")
     df_hist = _sb_load_last_hours(hours_back=24)
 
     if df_hist is None or df_hist.empty:
-        st.warning("Nu există snapshot-uri în Supabase. Apasă Refresh ca să inserezi primul.")
+        st.warning("Click refresh for snapshots")
         return
 
     df_plot = df_hist.dropna(subset=["ts_local", "power_kw", "name"]).copy()
     df_plot["ts_local"] = pd.to_datetime(df_plot["ts_local"], errors="coerce").dt.tz_localize(None)
+    wide = (
+        df_plot
+        .pivot_table(index="ts_local", columns="name", values="power_kw", aggfunc="last")
+        .sort_index()
+    )
 
-    wide = df_plot.pivot_table(index="ts_local", columns="name", values="power_kw", aggfunc="last").sort_index()
     if wide.empty:
         st.warning("Există date, dar nu pot construi seriile pentru grafic.")
         return
 
-    st.line_chart(wide)
+    # --- DOAR SUMA ---
+    total = wide.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
+    pattern = "|".join(FS_SUM_EXCLUDE_NAME_CONTAINS)
+    cols_keep = [c for c in wide.columns if pattern not in str(c).lower()]  # exclude după nume coloană
+    wide2 = wide[cols_keep] if cols_keep else wide
+
+    total = wide2.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
+    st.line_chart(total)
 
     if save_csv:
         csv_hist = df_hist[["ts_local", "name", "power_kw", "plant_code"]].to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV (Supabase 24h)", data=csv_hist, file_name="fusionsolar_rt_snapshots_24h.csv", mime="text/csv")
+        st.download_button("Download CSV", data=csv_hist, file_name="fusionsolar_rt_snapshots_24h.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
