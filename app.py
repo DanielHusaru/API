@@ -7,18 +7,19 @@ import pandas as pd
 import requests
 import streamlit as st
 from supabase import create_client
-import fusion_api as fs  
+import fusion_api as fs
+import altair as alt
 
 FS_TZ = ZoneInfo("Europe/Bucharest")
 FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia", "aldgate"]
 
-SB_TABLE_MAIN = "fs_power_snapshots"       
-SB_TABLE_SCRAPE = "fs_power_snapshots_rt"  
+SB_TABLE_MAIN = "fs_power_snapshots"
+SB_TABLE_SCRAPE = "fs_power_snapshots_rt"
 
 RT_FORCE_TS_SHIFT_HOURS: Optional[int] = None
 FUTURE_TOL_MIN = 2
 PAGE_SIZE = 1000
-MAX_PAGES = 200  
+MAX_PAGES = 200
 
 def _now_local_str() -> str:
     return datetime.datetime.now(tz=FS_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -493,7 +494,41 @@ def _render_main_total_chart(hours_back: int = 24):
     cols_keep = [c for c in wide.columns if not _is_excluded_name(c)]
     wide2 = wide[cols_keep] if cols_keep else wide
     total = wide2.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
-    st.line_chart(total)
+    chart_df = total.reset_index().rename(columns={"ts_local": "ts_local"})
+    chart = (
+        alt.Chart(chart_df)
+        .mark_line()
+        .encode(
+            x=alt.X("ts_local:T", title=None),
+            y=alt.Y("TOTAL_kW:Q", title=None),
+            tooltip=[
+                alt.Tooltip("ts_local:T", title="Time", format="%Y-%m-%d %H:%M:%S"),
+                alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
+            ],
+        )
+        .interactive()
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+def _agg_latest_for_table(latest: pd.DataFrame) -> pd.DataFrame:
+    if latest is None or latest.empty:
+        return pd.DataFrame(columns=["Nume", "Putere (kW)", "instance_key"])
+    d = latest.copy()
+    d["name_series"] = d["name_series"].fillna("").astype(str)
+    d["instance_key"] = d["instance_key"].fillna("").astype(str)
+    d["power_kw"] = pd.to_numeric(d["power_kw"], errors="coerce").fillna(0.0)
+    def _join_instances(s: pd.Series) -> str:
+        vals = [x for x in pd.unique(s.astype(str)) if x and x != "nan"]
+        vals = sorted(vals)
+        return ", ".join(vals)
+    out = (
+        d.groupby("name_series", as_index=False)
+        .agg(power_kw=("power_kw", "sum"), instance_key=("instance_key", _join_instances))
+        .rename(columns={"name_series": "Nume", "power_kw": "Putere (kW)"})
+    )
+    out["Putere (kW)"] = pd.to_numeric(out["Putere (kW)"], errors="coerce").fillna(0.0)
+    out = out.sort_values(["Nume"], ascending=True).reset_index(drop=True)
+    return out
 
 def _render_rt_metrics_like_main(df_rt: pd.DataFrame, title: str = "Scraping – Snapshot"):
     st.subheader(title)
@@ -505,102 +540,83 @@ def _render_rt_metrics_like_main(df_rt: pd.DataFrame, title: str = "Scraping –
         if df_rt.empty:
             st.warning("Eroare snapshot RT.")
             return
-
     latest = _latest_per_plant_not_future_rt(df_rt)
     if latest is None or latest.empty:
         st.warning("Nu găsesc valori valide.")
         return
-
     latest["power_kw"] = pd.to_numeric(latest["power_kw"], errors="coerce").fillna(0.0)
-
     active_mask = latest["power_kw"] > 0.0
     total = int(len(latest))
     active_cnt = int(active_mask.sum())
     inactive_cnt = total - active_cnt
-
     sum_kw = float(latest.loc[~latest["name_series"].map(_is_excluded_name), "power_kw"].fillna(0.0).sum())
-
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", total)
     m2.metric("Active", active_cnt)
     m3.metric("Inactive", inactive_cnt)
     m4.metric("Suma (kW)", f"{sum_kw:,.3f}".replace(",", " "))
-
     ts_snap_local = latest["ts_eff_utc"].max().astimezone(FS_TZ).strftime("%Y-%m-%d %H:%M:%S")
     st.caption(f"Snapshot: {ts_snap_local}")
-
     view = _agg_latest_for_table(latest)
     st.dataframe(view, use_container_width=True, hide_index=True)
 
+def _wide_sum_by_name_series(df_rt: pd.DataFrame) -> pd.DataFrame:
+    if df_rt is None or df_rt.empty:
+        return pd.DataFrame()
+    d = df_rt.copy()
+    if "ts_eff_utc" not in d.columns or "plant_uid" not in d.columns or "name_series" not in d.columns:
+        d = _scrape_enrich_df(d)
+        if d.empty:
+            return pd.DataFrame()
+    now = _now_utc() + datetime.timedelta(minutes=FUTURE_TOL_MIN)
+    d = d[d["ts_eff_utc"] <= now].copy()
+    d["power_kw"] = pd.to_numeric(d["power_kw"], errors="coerce").fillna(0.0)
+    d["ts_local_naive"] = d["ts_eff_utc"].dt.tz_convert(FS_TZ).dt.tz_localize(None)
+    d = d.sort_values(["plant_uid", "ts_local_naive"], ascending=[True, True])
+    d = d.drop_duplicates(subset=["plant_uid", "ts_local_naive"], keep="last")
+    plant_to_name = (
+        d.sort_values("ts_eff_utc")
+        .groupby("plant_uid")["name_series"]
+        .tail(1)
+    )
+    plant_to_name = plant_to_name.to_dict()
+    wide_plant = (
+        d.pivot(index="ts_local_naive", columns="plant_uid", values="power_kw")
+        .sort_index()
+    )
+    wide_plant = wide_plant.ffill().fillna(0.0)
+    col_names = {c: plant_to_name.get(c, str(c)) for c in wide_plant.columns}
+    wide_plant = wide_plant.rename(columns=col_names)
+    wide_name = wide_plant.groupby(axis=1, level=0).sum()
+    return wide_name
 
 def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafic TOTAL"):
     st.subheader(title)
     if df_rt is None or df_rt.empty:
         st.warning("Nu există date RT.")
         return
-
     wide = _wide_sum_by_name_series(df_rt)
     if wide is None or wide.empty:
         st.warning("Eroare date grafic.")
         return
-
     cols_keep = [c for c in wide.columns if not _is_excluded_name(c)]
     wide2 = wide[cols_keep] if cols_keep else wide
-
     total_series = wide2.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
-    st.line_chart(total_series)
-
-def _agg_latest_for_table(latest: pd.DataFrame) -> pd.DataFrame:
-    if latest is None or latest.empty:
-        return pd.DataFrame(columns=["Nume", "Putere (kW)", "instance_key"])
-
-    d = latest.copy()
-    d["name_series"] = d["name_series"].fillna("").astype(str)
-    d["instance_key"] = d["instance_key"].fillna("").astype(str)
-    d["power_kw"] = pd.to_numeric(d["power_kw"], errors="coerce").fillna(0.0)
-
-    def _join_instances(s: pd.Series) -> str:
-        vals = [x for x in pd.unique(s.astype(str)) if x and x != "nan"]
-        vals = sorted(vals)
-        return ", ".join(vals)
-
-    out = (
-        d.groupby("name_series", as_index=False)
-        .agg(power_kw=("power_kw", "sum"), instance_key=("instance_key", _join_instances))
-        .rename(columns={"name_series": "Nume", "power_kw": "Putere (kW)"})
+    chart_df = total_series.reset_index().rename(columns={"ts_local_naive": "ts_local"})
+    chart = (
+        alt.Chart(chart_df)
+        .mark_line()
+        .encode(
+            x=alt.X("ts_local:T", title=None),
+            y=alt.Y("TOTAL_kW:Q", title=None),
+            tooltip=[
+                alt.Tooltip("ts_local:T", title="Time", format="%Y-%m-%d %H:%M:%S"),
+                alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
+            ],
+        )
+        .interactive()
     )
-
-    out["Putere (kW)"] = pd.to_numeric(out["Putere (kW)"], errors="coerce").fillna(0.0)
-    out = out.sort_values(["Nume"], ascending=True).reset_index(drop=True)
-    return out
-
-
-def _wide_sum_by_name_series(df_rt: pd.DataFrame) -> pd.DataFrame:
-    if df_rt is None or df_rt.empty:
-        return pd.DataFrame()
-
-    d = df_rt.copy()
-    if "ts_eff_utc" not in d.columns or "plant_uid" not in d.columns or "name_series" not in d.columns:
-        d = _scrape_enrich_df(d)
-        if d.empty:
-            return pd.DataFrame()
-
-    now = _now_utc() + datetime.timedelta(minutes=FUTURE_TOL_MIN)
-    d = d[d["ts_eff_utc"] <= now].copy()
-
-    d["power_kw"] = pd.to_numeric(d["power_kw"], errors="coerce").fillna(0.0)
-    d["ts_local_naive"] = d["ts_eff_utc"].dt.tz_convert(FS_TZ).dt.tz_localize(None)
-
-    d = d.sort_values(["plant_uid", "ts_eff_utc"], ascending=[True, True])
-    d = d.drop_duplicates(subset=["plant_uid", "ts_local_naive"], keep="last")
-
-    grouped = (
-        d.groupby(["ts_local_naive", "name_series"], as_index=False)["power_kw"]
-        .sum()
-    )
-
-    wide = grouped.pivot(index="ts_local_naive", columns="name_series", values="power_kw").sort_index()
-    return wide
+    st.altair_chart(chart, use_container_width=True)
 
 def render_page():
     st.session_state.setdefault("fs_refresh_cooldown_until", 0.0)
