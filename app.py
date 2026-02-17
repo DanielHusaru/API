@@ -63,6 +63,40 @@ def _decode_error_reason(msg: str) -> str:
         return "FĂRĂ DREPTURI (20056) – contul API nu e autorizat"
     return msg
 
+SCRAPE_ALIAS_RENAMES = {
+    "fomco mures": "Fomco_Wood_PVPP",
+}
+
+SCRAPE_ALIAS_GROUPS = {
+    "Fomco_Solar_Systems_PVPP": [
+        "Fomco_SANGEROIU",
+        "Fomco_Chirileu",
+        "Fomco_Chirileu_2_PVPP",
+    ],
+    "Greenford_Solar_PVPP": [
+        "Magureni",
+        "Sarulesti",
+    ],
+}
+SOURCE_INTERVAL_MIN = {
+    "aurora": 15,
+    "sunnyportal": 15,
+    "supremia": 15,
+    "veltos": 15,
+    "fusion": 5,
+    "growat": 5,
+    "hypon": 5,
+    "photonenergy": 5,
+}
+DEFAULT_INTERVAL_MIN = 15
+
+def _source_interval_min(instance_key: str) -> int:
+    k = str(instance_key or "").lower()
+    for name, mins in SOURCE_INTERVAL_MIN.items():
+        if name in k:
+            return int(mins)
+    return int(DEFAULT_INTERVAL_MIN)
+  
 
 def _apply_aliases_inplace(df: pd.DataFrame) -> pd.DataFrame:
     cfg = st.secrets.get("fusionsolar", {}) or {}
@@ -386,6 +420,72 @@ def _fetch_table_all_instances(instances: Dict[str, dict], token_ttl_sec: int) -
         df = df.sort_values(by=["Instanță", "Active", "Nume"], ascending=[True, False, True]).reset_index(drop=True)
     return df
 
+def _norm_alias(s: str) -> str:
+    return " ".join(str(s or "").strip().split()).lower()
+
+def _apply_alias_rules_to_snapshot(view: pd.DataFrame) -> pd.DataFrame:
+    if view is None or view.empty:
+        return view
+
+    d = view.copy()
+    d["Nume"] = d["Nume"].fillna("").astype(str)
+    d["Putere (kW)"] = pd.to_numeric(d["Putere (kW)"], errors="coerce").fillna(0.0)
+
+    target_by_norm = {}
+
+    for src, tgt in (SCRAPE_ALIAS_RENAMES or {}).items():
+        target_by_norm[_norm_alias(src)] = str(tgt)
+
+    for tgt, members in (SCRAPE_ALIAS_GROUPS or {}).items():
+        tgt = str(tgt)
+        for m in members:
+            target_by_norm[_norm_alias(m)] = tgt
+
+    def map_alias(name):
+        norm = _norm_alias(name)
+        for src_norm, tgt in target_by_norm.items():
+            if src_norm in norm:
+                return tgt
+        return name
+
+    d["_target"] = d["Nume"].map(map_alias)
+
+    out = (
+        d.groupby("_target", as_index=False)
+        .agg(
+            **{
+                "Putere (kW)": ("Putere (kW)", "sum"),
+                "Delay (min)": ("Delay (min)", "max"),
+            }
+        )
+        .rename(columns={"_target": "Nume"})
+    )
+    out["Putere (kW)"] = pd.to_numeric(out["Putere (kW)"], errors="coerce").fillna(0.0)
+    out["Delay (min)"] = pd.to_numeric(out["Delay (min)"], errors="coerce").fillna(0.0).round(0).astype(int)
+    out["Nume"] = out["Nume"].fillna("").astype(str)
+    out = out.sort_values("Nume").reset_index(drop=True)
+    return out
+
+
+def _apply_alias_rules_to_wide(wide: pd.DataFrame) -> pd.DataFrame:
+    if wide is None or wide.empty:
+        return wide
+
+    w = wide.copy()
+    w.columns = [str(c) for c in w.columns]
+
+    target_by_norm = {}
+    for src, tgt in (SCRAPE_ALIAS_RENAMES or {}).items():
+        target_by_norm[_norm_alias(src)] = str(tgt)
+    for tgt, members in (SCRAPE_ALIAS_GROUPS or {}).items():
+        tgt = str(tgt)
+        for m in members:
+            target_by_norm[_norm_alias(m)] = tgt
+
+    w = w.rename(columns={c: target_by_norm.get(_norm_alias(c), c) for c in w.columns})
+    w = w.T.groupby(level=0).sum().T
+    return w
+
 
 def _render_main_metrics_table(df_live: pd.DataFrame):
     if df_live is None or df_live.empty:
@@ -441,39 +541,40 @@ def _render_main_total_chart(hours_back: int = 24):
 def _scrape_enrich_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+
     d = df.copy()
-    for c in ["ts_local", "plant_code", "plant_name", "alias_name", "instance_key", "power_kw"]:
+    for c in ["ts_local", "inserted_at", "plant_code", "plant_name", "alias_name", "instance_key", "power_kw"]:
         if c not in d.columns:
             d[c] = None
+
     d["ts_local"] = _to_local_naive(d["ts_local"])
+
+    ins = pd.to_datetime(d["inserted_at"], utc=True, errors="coerce")
+    ins_local = ins.dt.tz_convert(FS_TZ).dt.tz_localize(None)
+    d["inserted_local"] = ins_local
+
+    d["delay_min"] = ((d["inserted_local"] - d["ts_local"]).dt.total_seconds() / 60.0)
+    d["delay_min"] = pd.to_numeric(d["delay_min"], errors="coerce").fillna(0.0)
+    d.loc[d["delay_min"] < 0, "delay_min"] = 0.0
+
     d["plant_code"] = d["plant_code"].fillna("").astype(str)
     d["plant_name"] = d["plant_name"].fillna("").astype(str)
     d["alias_name"] = d["alias_name"].fillna("").astype(str)
     d["instance_key"] = d["instance_key"].fillna("").astype(str)
     d["power_kw"] = pd.to_numeric(d["power_kw"], errors="coerce").fillna(0.0)
+
     d = d.dropna(subset=["ts_local"]).sort_values("ts_local", ascending=True).reset_index(drop=True)
     d["plant_uid"] = d["plant_code"] + "|" + d["plant_name"]
     return d
 
 
 def _sb_select_history_rt(hours_back: int = 24) -> pd.DataFrame:
-    sb = _sb_client(service=True)
-    last = (
-        sb.table(SB_TABLE_SCRAPE)
-        .select("ts_local")
-        .order("ts_local", desc=True)
-        .limit(1)
-        .execute()
-    )
-    last_rows = last.data or []
-    if not last_rows:
-        return pd.DataFrame()
-    last_ts = pd.to_datetime(last_rows[0]["ts_local"], errors="coerce")
-    if pd.isna(last_ts):
-        return pd.DataFrame()
-    since_ts = last_ts - pd.Timedelta(hours=hours_back)
+    now_local_naive = datetime.datetime.now(FS_TZ).replace(tzinfo=None)
+    since_ts = now_local_naive - datetime.timedelta(hours=hours_back)
     since_iso = since_ts.strftime("%Y-%m-%d %H:%M:%S")
-    select_cols = "ts_local,plant_code,plant_name,alias_name,instance_key,power_kw"
+
+    select_cols = "ts_local,inserted_at,plant_code,plant_name,alias_name,instance_key,power_kw"
+
     df = _sb_fetch_paged(
         table=SB_TABLE_SCRAPE,
         select_cols=select_cols,
@@ -487,30 +588,45 @@ def _sb_select_history_rt(hours_back: int = 24) -> pd.DataFrame:
         return pd.DataFrame()
     return _scrape_enrich_df(df)
 
-
 def _latest_per_alias_table(df_master: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[datetime.datetime]]:
     if df_master is None or df_master.empty:
-        return pd.DataFrame(columns=["Nume", "Putere (kW)"]), None
+        return pd.DataFrame(columns=["Nume", "Putere (kW)", "Delay (min)"]), None
+
     d = _scrape_enrich_df(df_master)
-    if d.empty:
-        return pd.DataFrame(columns=["Nume", "Putere (kW)"]), None
+    if d is None or d.empty:
+        return pd.DataFrame(columns=["Nume", "Putere (kW)", "Delay (min)"]), None
+
     now_local_naive = (datetime.datetime.now(FS_TZ) + datetime.timedelta(minutes=FUTURE_TOL_MIN)).replace(tzinfo=None)
     d = d[d["ts_local"] <= now_local_naive].copy()
     if d.empty:
-        return pd.DataFrame(columns=["Nume", "Putere (kW)"]), None
+        return pd.DataFrame(columns=["Nume", "Putere (kW)", "Delay (min)"]), None
+
     d = d.sort_values("ts_local", ascending=True)
-    last_per_plant = d.groupby("plant_uid", as_index=False).tail(1)
+
+    last_per_plant = d.groupby("plant_uid", as_index=False).tail(1).copy()
     snap_ts = last_per_plant["ts_local"].max() if not last_per_plant.empty else None
+
+    intervals = last_per_plant["instance_key"].map(_source_interval_min).astype(float)
+    raw_lag = (now_local_naive - last_per_plant["ts_local"]).dt.total_seconds() / 60.0
+    delay_min = (raw_lag - intervals).clip(lower=0.0)
+
+    last_per_plant["delay_min"] = pd.to_numeric(delay_min, errors="coerce").fillna(0.0)
+
     view = (
         last_per_plant.groupby("alias_name", as_index=False)
-        .agg(power_kw=("power_kw", "sum"))
-        .rename(columns={"alias_name": "Nume", "power_kw": "Putere (kW)"})
+        .agg(
+            power_kw=("power_kw", "sum"),
+            delay_min=("delay_min", "max"),
+        )
+        .rename(columns={"alias_name": "Nume", "power_kw": "Putere (kW)", "delay_min": "Delay (min)"})
     )
-    view["Putere (kW)"] = pd.to_numeric(view["Putere (kW)"], errors="coerce").fillna(0.0)
-    view["Nume"] = view["Nume"].fillna("").astype(str)
-    view = view.sort_values("Nume").reset_index(drop=True)
-    return view, snap_ts
 
+    view["Putere (kW)"] = pd.to_numeric(view["Putere (kW)"], errors="coerce").fillna(0.0)
+    view["Delay (min)"] = pd.to_numeric(view["Delay (min)"], errors="coerce").fillna(0.0).round(0).astype(int)
+
+    view = _apply_alias_rules_to_snapshot(view)
+
+    return view, snap_ts
 
 def _wide_total_15min(df_master: pd.DataFrame) -> pd.DataFrame:
     if df_master is None or df_master.empty:
@@ -530,9 +646,10 @@ def _wide_total_15min(df_master: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     idx_full = pd.date_range(wide_plant.index.min(), wide_plant.index.max(), freq="15min")
     wide_plant = wide_plant.reindex(idx_full).ffill().fillna(0.0)
-    plant_to_alias = d.sort_values("ts_local").groupby("plant_uid")["alias_name"].tail(1).to_dict()
+    plant_to_alias = d.sort_values("ts_local").groupby("plant_uid")["alias_name"].last().to_dict()
     wide_plant = wide_plant.rename(columns={c: plant_to_alias.get(c, c) for c in wide_plant.columns})
     wide_alias = wide_plant.T.groupby(level=0).sum().T
+    wide_alias = _apply_alias_rules_to_wide(wide_alias)
     cols_keep = [c for c in wide_alias.columns if not _is_excluded_name(c)]
     wide2 = wide_alias[cols_keep] if cols_keep else wide_alias
     total_series = wide2.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
@@ -561,7 +678,7 @@ def _render_rt_metrics_like_main(df_rt: pd.DataFrame, title: str = "Scraping –
     m4.metric("Suma (kW)", f"{sum_kw:,.3f}".replace(",", " "))
     snap_str = snap_ts.strftime("%Y-%m-%d %H:%M:%S") if isinstance(snap_ts, datetime.datetime) else "-"
     st.caption(f"Snapshot: {snap_str}")
-    st.dataframe(view[["Nume", "Putere (kW)"]], use_container_width=True, hide_index=True)
+    st.dataframe(view[["Nume", "Putere (kW)", "Delay (min)"]], use_container_width=True, hide_index=True)
 
 
 def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafic TOTAL"):
