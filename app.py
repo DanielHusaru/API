@@ -559,12 +559,12 @@ def _scrape_enrich_df(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def _sb_select_history_rt(hours_back: int = 24) -> pd.DataFrame:
+def _sb_select_history_rt(hours_back: int = 24 * 30) -> pd.DataFrame:
     now_local_naive = datetime.datetime.now(FS_TZ).replace(tzinfo=None)
     since_ts = now_local_naive - datetime.timedelta(hours=hours_back)
     since_iso = since_ts.strftime("%Y-%m-%d %H:%M:%S")
 
-    select_cols = "ts_local,inserted_at,plant_code,plant_name,alias_name,instance_key,power_kw"
+    select_cols = "ts_local,inserted_at,last_modified,plant_code,plant_name,alias_name,instance_key,power_kw"
 
     df = _sb_fetch_paged(
         table=SB_TABLE_SCRAPE,
@@ -682,18 +682,26 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
         st.warning("Eroare date grafic.")
         return
     chart = (
-        alt.Chart(chart_df)
-        .mark_line()
-        .encode(
-            x=alt.X("ts_local:T", title=None),
-            y=alt.Y("TOTAL_kW:Q", title=None),
-            tooltip=[
-                alt.Tooltip("ts_local:T", title="Time", format="%Y-%m-%d %H:%M:%S"),
-                alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
-            ],
-        )
-        .interactive()
+    alt.Chart(chart_df)
+    .mark_line()
+    .encode(
+        x=alt.X(
+            "ts_local:T",
+            title=None,
+            axis=alt.Axis(
+                tickCount="hour",
+        labelExpr="hours(datum.value)==0 ? timeFormat(datum.value, '%d.%m') : timeFormat(datum.value, '%H:%M')"
+            )
+        ),
+        y=alt.Y("TOTAL_kW:Q", title=None),
+        tooltip=[
+            alt.Tooltip("ts_local:T", title="Time", format="%d.%m %H:%M"),
+            alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
+        ],
     )
+    .interactive()
+)
+
     st.altair_chart(chart, use_container_width=True)
 
 
@@ -765,7 +773,7 @@ def render_page():
     save_csv_rt = c2.button("Save CSV", key="btn_save_rt")
 
     if reload_rt or st.session_state.get("rt_hist_cache") is None:
-        st.session_state["rt_hist_cache"] = _sb_select_history_rt(hours_back=24)
+        st.session_state["rt_hist_cache"] = _sb_select_history_rt(hours_back=24*30)
         st.session_state["rt_hist_last_load"] = _now_local_str()
 
     st.caption(f"Ultima încărcare RT: {st.session_state.get('rt_hist_last_load', '-')}")
@@ -779,7 +787,6 @@ def render_page():
         out = _scrape_enrich_df(df_rt).copy()
         out["ts_local_str"] = pd.to_datetime(out["ts_local"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         csv_hist = out[["ts_local_str", "alias_name", "power_kw", "plant_code", "plant_name", "instance_key"]].to_csv(index=False).encode("utf-8")
-        st.download_button("Download CSV", data=csv_hist, file_name="fs_power_master_24h.csv", mime="text/csv")
 
 
 if __name__ == "__main__":
