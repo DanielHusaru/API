@@ -602,6 +602,8 @@ def _latest_per_alias_table(df_master: pd.DataFrame) -> Tuple[pd.DataFrame, Opti
     delay_min = (raw_lag - intervals).clip(lower=0.0)
 
     last_per_plant["delay_min"] = pd.to_numeric(delay_min, errors="coerce").fillna(0.0)
+    overhead = last_per_plant["delay_min"] > 60
+    last_per_plant.loc[overhead, "power_kw"] = 0.0
 
     view = (
         last_per_plant.groupby("alias_name", as_index=False)
