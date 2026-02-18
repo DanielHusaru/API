@@ -64,19 +64,10 @@ def _decode_error_reason(msg: str) -> str:
     return msg
 
 SCRAPE_ALIAS_RENAMES = {
-    "fomco mures": "Fomco_Wood_PVPP",
+    
 }
 
 SCRAPE_ALIAS_GROUPS = {
-    "Fomco_Solar_Systems_PVPP": [
-        "Fomco_SANGEROIU",
-        "Fomco_Chirileu",
-        "Fomco_Chirileu_2_PVPP",
-    ],
-    "Greenford_Solar_PVPP": [
-        "Magureni",
-        "Sarulesti",
-    ],
 }
 SOURCE_INTERVAL_MIN = {
     "aurora": 15,
