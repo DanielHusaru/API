@@ -673,39 +673,88 @@ def _render_rt_metrics_like_main(df_rt: pd.DataFrame, title: str = "Scraping –
     st.caption(f"Snapshot: {snap_str}")
     st.dataframe(view[["Nume", "Putere (kW)", "Delay (min)"]], use_container_width=True, hide_index=True)
 
-
 def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafic TOTAL"):
     st.subheader(title)
+
     if df_rt is None or df_rt.empty:
         st.warning("Nu există date RT.")
         return
+
     chart_df = _wide_total_15min(df_rt)
     if chart_df is None or chart_df.empty:
         st.warning("Eroare date grafic.")
         return
-    chart = (
-    alt.Chart(chart_df)
-    .mark_line()
-    .encode(
-        x=alt.X(
-            "ts_local:T",
-            title=None,
-            axis=alt.Axis(
-                tickCount="hour",
-        labelExpr="hours(datum.value)==0 ? timeFormat(datum.value, '%d.%m') : timeFormat(datum.value, '%H:%M')"
-            )
-        ),
-        y=alt.Y("TOTAL_kW:Q", title=None),
-        tooltip=[
-            alt.Tooltip("ts_local:T", title="Time", format="%d.%m %H:%M"),
-            alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
-        ],
+
+    chart_df = chart_df.copy()
+    chart_df["ts_local"] = pd.to_datetime(chart_df["ts_local"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["ts_local"]).sort_values("ts_local")
+    if chart_df.empty:
+        st.warning("Nu există timestamps valide.")
+        return
+
+    # min/max din date
+    min_t = chart_df["ts_local"].min().to_pydatetime()
+    max_t = chart_df["ts_local"].max().to_pydatetime()
+
+    # default: azi (dar clamped în [min_t, max_t])
+    now = datetime.datetime.now(FS_TZ).replace(tzinfo=None)
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    default_start = max(min_t, min(start_today, max_t))
+    default_end = max(min_t, min(now, max_t))
+    if default_end < default_start:
+        default_start = min_t
+        default_end = max_t
+
+    start, end = st.slider(
+        "Interval",
+        min_value=min_t,
+        max_value=max_t,
+        value=(default_start, default_end),
+        step=datetime.timedelta(minutes=15),
+        format="YYYY-MM-DD HH:mm",
+        key="rt_interval_slider",
     )
-    .interactive()
-)
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    filtered = chart_df[(chart_df["ts_local"] >= start_ts) & (chart_df["ts_local"] <= end_ts)].copy()
+
+
+    if filtered.empty:
+        st.warning("Nu există date în intervalul selectat.")
+        return
+
+    # tick-uri din oră în oră, ca să nu fie haos
+    tick_vals = pd.date_range(
+        pd.Timestamp(start_ts).floor("H"),
+        pd.Timestamp(end_ts).ceil("H"),
+        freq="1H",
+    ).to_pydatetime().tolist()
+
+    chart = (
+        alt.Chart(filtered)
+        .mark_line()
+        .encode(
+            x=alt.X(
+                "ts_local:T",
+                title=None,
+                axis=alt.Axis(
+                    values=tick_vals,
+                    labelExpr="hours(datum.value)==0 ? timeFormat(datum.value, '%d.%m') : timeFormat(datum.value, '%H:%M')",
+                ),
+            ),
+            y=alt.Y("TOTAL_kW:Q", title=None),
+            tooltip=[
+                alt.Tooltip("ts_local:T", title="Time", format="%d.%m %H:%M"),
+                alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
+            ],
+        )
+        .interactive()
+    )
 
     st.altair_chart(chart, use_container_width=True)
-
 
 def render_page():
     st.session_state.setdefault("fs_refresh_cooldown_until", 0.0)
