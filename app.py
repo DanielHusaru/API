@@ -711,7 +711,7 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
         min_value=min_t,
         max_value=max_t,
         value=(default_start, default_end),
-        step=datetime.timedelta(minutes=15),
+        step=datetime.timedelta(minutes=5),
         format="YYYY-MM-DD HH:mm",
         key="rt_interval_slider",
     )
