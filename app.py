@@ -11,7 +11,7 @@ import fusion_api as fs
 import altair as alt
 
 FS_TZ = ZoneInfo("Europe/Bucharest")
-FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia", "aldgate"]
+FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia"]
 
 SB_TABLE_MAIN = "fs_power_snapshots"
 SB_TABLE_SCRAPE = "fs_power_master"
@@ -222,19 +222,18 @@ def _sb_upsert_snapshot_main(df_ins: pd.DataFrame) -> None:
 
 
 def _sb_load_main_last_hours(hours_back: int = 24) -> pd.DataFrame:
-    sb = _sb_client(service=False)
     since_utc = (_now_utc() - datetime.timedelta(hours=hours_back)).isoformat()
-    res = (
-        sb.table(SB_TABLE_MAIN)
-        .select("ts_utc,station_key,instance_key,plant_code,plant_name,alias_name,power_kw")
-        .gte("ts_utc", since_utc)
-        .order("ts_utc", desc=False)
-        .execute()
+    df = _sb_fetch_paged(
+        table=SB_TABLE_MAIN,
+        select_cols="ts_utc,station_key,instance_key,plant_code,plant_name,alias_name,power_kw",
+        filter_col="ts_utc",
+        since_iso=since_utc,
+        order_col="ts_utc",
+        desc=False,
+        service=False,
     )
-    rows = res.data or []
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
+    if df is None or df.empty:
+        return pd.DataFrame()
     df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True, errors="coerce")
     df["ts_local"] = df["ts_utc"].dt.tz_convert(FS_TZ)
     df["power_kw"] = pd.to_numeric(df["power_kw"], errors="coerce")
@@ -446,7 +445,7 @@ def _apply_alias_rules_to_snapshot(view: pd.DataFrame) -> pd.DataFrame:
         .agg(
             **{
                 "Putere (kW)": ("Putere (kW)", "sum"),
-                "Delay (min)": ("Delay (min)", "max"),
+                "Delay (min)": ("Delay (min)", "min"),
             }
         )
         .rename(columns={"_target": "Nume"})
@@ -505,22 +504,88 @@ def _render_main_total_chart(hours_back: int = 24):
         return
     df_plot = df_hist.dropna(subset=["ts_local", "power_kw", "name"]).copy()
     df_plot["ts_local"] = pd.to_datetime(df_plot["ts_local"], errors="coerce").dt.tz_localize(None)
-    wide = df_plot.pivot_table(index="ts_local", columns="name", values="power_kw", aggfunc="last").sort_index()
+    if df_plot.empty:
+        st.warning("Nu pot construi graficul.")
+        return
+
+    df_plot["ts_bucket"] = df_plot["ts_local"].dt.floor("5min")
+    df_plot = df_plot.sort_values("ts_local").drop_duplicates(
+        subset=["name", "ts_bucket"], keep="last"
+    )
+
+    wide = df_plot.pivot_table(
+        index="ts_bucket", columns="name", values="power_kw", aggfunc="last"
+    ).sort_index()
     if wide.empty:
         st.warning("Nu pot construi graficul.")
         return
+
+    idx_full = pd.date_range(wide.index.min(), wide.index.max(), freq="5min")
+    wide = wide.reindex(idx_full).ffill().fillna(0.0)
+
     cols_keep = [c for c in wide.columns if not _is_excluded_name(c)]
     wide2 = wide[cols_keep] if cols_keep else wide
-    total = wide2.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
-    chart_df = total.reset_index().rename(columns={"ts_local": "ts_local"})
+    chart_df = wide2.sum(axis=1, skipna=True).to_frame("TOTAL_kW")
+    chart_df = chart_df.reset_index().rename(columns={"index": "ts_local"})
+    chart_df["ts_local"] = pd.to_datetime(chart_df["ts_local"], errors="coerce")
+    chart_df = chart_df.dropna(subset=["ts_local"]).sort_values("ts_local")
+    if chart_df.empty:
+        st.warning("Nu există timestamps valide.")
+        return
+
+    min_t = chart_df["ts_local"].min().to_pydatetime()
+    max_t = chart_df["ts_local"].max().to_pydatetime()
+
+    now = datetime.datetime.now(FS_TZ).replace(tzinfo=None)
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    default_start = max(min_t, min(start_today, max_t))
+    default_end = max(min_t, min(now, max_t))
+    if default_end < default_start:
+        default_start = min_t
+        default_end = max_t
+
+    start, end = st.slider(
+        "Interval",
+        min_value=min_t,
+        max_value=max_t,
+        value=(default_start, default_end),
+        step=datetime.timedelta(minutes=5),
+        format="YYYY-MM-DD HH:mm",
+        key="main_interval_slider",
+    )
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    filtered = chart_df[
+        (chart_df["ts_local"] >= start_ts) & (chart_df["ts_local"] <= end_ts)
+    ].copy()
+
+    if filtered.empty:
+        st.warning("Nu există date în intervalul selectat.")
+        return
+
+    tick_vals = pd.date_range(
+        pd.Timestamp(start_ts).floor("H"),
+        pd.Timestamp(end_ts).ceil("H"),
+        freq="1H",
+    ).to_pydatetime().tolist()
+
     chart = (
-        alt.Chart(chart_df)
+        alt.Chart(filtered)
         .mark_line()
         .encode(
-            x=alt.X("ts_local:T", title=None),
+            x=alt.X(
+                "ts_local:T",
+                title=None,
+                axis=alt.Axis(
+                    values=tick_vals,
+                    labelExpr="hours(datum.value)==0 ? timeFormat(datum.value, '%d.%m') : timeFormat(datum.value, '%H:%M')",
+                ),
+            ),
             y=alt.Y("TOTAL_kW:Q", title=None),
             tooltip=[
-                alt.Tooltip("ts_local:T", title="Time", format="%Y-%m-%d %H:%M:%S"),
+                alt.Tooltip("ts_local:T", title="Time", format="%d.%m %H:%M"),
                 alt.Tooltip("TOTAL_kW:Q", title="TOTAL_kW", format=",.3f"),
             ],
         )
@@ -609,7 +674,7 @@ def _latest_per_alias_table(df_master: pd.DataFrame) -> Tuple[pd.DataFrame, Opti
         last_per_plant.groupby("alias_name", as_index=False)
         .agg(
             power_kw=("power_kw", "sum"),
-            delay_min=("delay_min", "max"),
+            delay_min=("delay_min", "min"),
         )
         .rename(columns={"alias_name": "Nume", "power_kw": "Putere (kW)", "delay_min": "Delay (min)"})
     )
@@ -692,11 +757,9 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
         st.warning("Nu există timestamps valide.")
         return
 
-    # min/max din date
     min_t = chart_df["ts_local"].min().to_pydatetime()
     max_t = chart_df["ts_local"].max().to_pydatetime()
 
-    # default: azi (dar clamped în [min_t, max_t])
     now = datetime.datetime.now(FS_TZ).replace(tzinfo=None)
     start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
@@ -726,7 +789,6 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
         st.warning("Nu există date în intervalul selectat.")
         return
 
-    # tick-uri din oră în oră, ca să nu fie haos
     tick_vals = pd.date_range(
         pd.Timestamp(start_ts).floor("H"),
         pd.Timestamp(end_ts).ceil("H"),
@@ -755,6 +817,118 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
     )
 
     st.altair_chart(chart, use_container_width=True)
+
+def _sb_export_filtered(
+    date_from: datetime.date,
+    date_to: datetime.date,
+    alias_filter: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    since_iso = datetime.datetime.combine(date_from, datetime.time.min).strftime("%Y-%m-%d %H:%M:%S")
+    until_naive = datetime.datetime.combine(date_to, datetime.time.max).replace(microsecond=0)
+    until_iso = until_naive.strftime("%Y-%m-%d %H:%M:%S")
+
+    sb = _sb_client(service=True)
+    all_rows: List[dict] = []
+    select_cols = "ts_local,inserted_at,plant_code,plant_name,alias_name,instance_key,power_kw"
+    for page in range(MAX_PAGES):
+        start = page * PAGE_SIZE
+        end = start + PAGE_SIZE - 1
+        q = (
+            sb.table(SB_TABLE_SCRAPE)
+            .select(select_cols)
+            .gte("ts_local", since_iso)
+            .lte("ts_local", until_iso)
+            .order("ts_local", desc=False)
+            .range(start, end)
+        )
+        res = q.execute()
+        rows = res.data or []
+        all_rows.extend(rows)
+        if len(rows) < PAGE_SIZE:
+            break
+
+    if not all_rows:
+        return pd.DataFrame()
+
+    df = _scrape_enrich_df(pd.DataFrame(all_rows))
+    if df.empty:
+        return df
+
+    if alias_filter:
+        norms = {_norm_alias(a) for a in alias_filter}
+        df = df[df["alias_name"].map(_norm_alias).isin(norms)].copy()
+
+    return df
+
+
+def _render_export_section(df_rt: Optional[pd.DataFrame]):
+    st.subheader("Export date")
+
+    aliases: List[str] = []
+    if df_rt is not None and not df_rt.empty:
+        d = _scrape_enrich_df(df_rt)
+        if not d.empty:
+            aliases = sorted(d["alias_name"].dropna().unique().tolist())
+    if not aliases:
+        st.warning("Nu sunt centrale disponibile. Încarcă mai întâi datele din secțiunea Scraping.")
+        return
+
+    today = _today_local_date()
+    yesterday = today - datetime.timedelta(days=1)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        date_from = st.date_input("From", value=yesterday, max_value=today, key="export_date_from")
+    with c2:
+        date_to = st.date_input("To", value=yesterday, max_value=today, key="export_date_to")
+
+    if date_from > date_to:
+        st.error("Data de început trebuie să fie înainte de data de sfârșit.")
+        return
+
+    selected_aliases = st.multiselect(
+        "PVPP",
+        options=["ALL"] + aliases,
+        default=["ALL"],
+        key="export_aliases",
+    )
+
+    use_all = "ALL" in selected_aliases or not selected_aliases
+    alias_filter = None if use_all else selected_aliases
+
+    if st.button("Export CSV", key="btn_export_csv"):
+        with st.spinner("Loading..."):
+            df_exp = _sb_export_filtered(date_from, date_to, alias_filter=alias_filter)
+
+        if df_exp is None or df_exp.empty:
+            st.warning("No match for the selected criteria.")
+            return
+
+        df_out = df_exp.copy()
+        df_out["ts_local_str"] = pd.to_datetime(df_out["ts_local"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+        csv_cols = ["ts_local_str", "alias_name", "power_kw", "plant_code", "plant_name", "instance_key"]
+        csv_cols = [c for c in csv_cols if c in df_out.columns]
+        csv_bytes = df_out[csv_cols].to_csv(index=False).encode("utf-8")
+
+        label_aliases = "toate" if use_all else "_".join(selected_aliases[:3])
+        filename = f"export_{date_from}_{date_to}_{label_aliases}.csv"
+
+        st.download_button(
+            label=f"Download",
+            data=csv_bytes,
+            file_name=filename,
+            mime="text/csv",
+            key="btn_download_export",
+        )
+
+        st.dataframe(
+            df_out[csv_cols].head(200),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if len(df_out) > 200:
+            st.caption(f"Se afișează primele 200 din {len(df_out)} rânduri. Descarcă CSV-ul pentru toate.")
+
 
 def render_page():
     st.session_state.setdefault("fs_refresh_cooldown_until", 0.0)
@@ -838,6 +1012,9 @@ def render_page():
         out = _scrape_enrich_df(df_rt).copy()
         out["ts_local_str"] = pd.to_datetime(out["ts_local"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         csv_hist = out[["ts_local_str", "alias_name", "power_kw", "plant_code", "plant_name", "instance_key"]].to_csv(index=False).encode("utf-8")
+
+    st.divider()
+    _render_export_section(df_rt)
 
 
 if __name__ == "__main__":
