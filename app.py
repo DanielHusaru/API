@@ -544,7 +544,14 @@ def _render_main_total_chart(hours_back: int = 24):
     if default_end < default_start:
         default_start = min_t
         default_end = max_t
-
+    if min_t >= max_t:
+        max_t = min_t + datetime.timedelta(minutes=5)
+    if default_start >= default_end:
+        default_end = min(default_start + datetime.timedelta(minutes=5), max_t)
+    if default_start < min_t:
+        default_start = min_t
+    if default_end > max_t:
+        default_end = max_t
     start, end = st.slider(
         "Interval",
         min_value=min_t,
@@ -768,7 +775,14 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
     if default_end < default_start:
         default_start = min_t
         default_end = max_t
-
+    if min_t >= max_t:
+        max_t = min_t + datetime.timedelta(minutes=5)
+    if default_start >= default_end:
+        default_end = min(default_start + datetime.timedelta(minutes=5), max_t)
+    if default_start < min_t:
+        default_start = min_t
+    if default_end > max_t:
+        default_end = max_t
     start, end = st.slider(
         "Interval",
         min_value=min_t,
