@@ -573,8 +573,8 @@ def _render_main_total_chart(hours_back: int = 24):
         return
 
     tick_vals = pd.date_range(
-        pd.Timestamp(start_ts).floor("H"),
-        pd.Timestamp(end_ts).ceil("H"),
+        pd.Timestamp(start_ts).floor("h"),
+        pd.Timestamp(end_ts).ceil("h"),
         freq="1H",
     ).to_pydatetime().tolist()
 
@@ -804,8 +804,8 @@ def _render_rt_total_chart(df_rt: pd.DataFrame, title: str = "Scraping – Grafi
         return
 
     tick_vals = pd.date_range(
-        pd.Timestamp(start_ts).floor("H"),
-        pd.Timestamp(end_ts).ceil("H"),
+        pd.Timestamp(start_ts).floor("h"),
+        pd.Timestamp(end_ts).ceil("h"),
         freq="1H",
     ).to_pydatetime().tolist()
 
