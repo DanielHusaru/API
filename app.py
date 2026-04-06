@@ -20,6 +20,8 @@ FUTURE_TOL_MIN = 2
 PAGE_SIZE = 1000
 MAX_PAGES = 200
 
+RT_DEFAULT_HOURS_BACK = 24
+
 
 def _now_local_str() -> str:
     return datetime.datetime.now(tz=FS_TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -178,6 +180,7 @@ def _sb_fetch_paged(
     order_col: str,
     desc: bool,
     service: bool = False,
+    until_iso: Optional[str] = None,
 ) -> pd.DataFrame:
     sb = _sb_client(service=service)
     all_rows: List[dict] = []
@@ -188,9 +191,10 @@ def _sb_fetch_paged(
             sb.table(table)
             .select(select_cols)
             .gte(filter_col, since_iso)
-            .order(order_col, desc=desc)
-            .range(start, end)
         )
+        if until_iso:
+            q = q.lte(filter_col, until_iso)
+        q = q.order(order_col, desc=desc).range(start, end)
         res = q.execute()
         rows = res.data or []
         all_rows.extend(rows)
@@ -631,7 +635,9 @@ def _scrape_enrich_df(df: pd.DataFrame) -> pd.DataFrame:
     return d
 
 
-def _sb_select_history_rt(hours_back: int = 24 * 30) -> pd.DataFrame:
+
+def _sb_select_history_rt(hours_back: int = RT_DEFAULT_HOURS_BACK) -> pd.DataFrame:
+    """Încarcă date din Supabase – implicit doar ultimele 24h."""
     now_local_naive = datetime.datetime.now(FS_TZ).replace(tzinfo=None)
     since_ts = now_local_naive - datetime.timedelta(hours=hours_back)
     since_iso = since_ts.strftime("%Y-%m-%d %H:%M:%S")
@@ -651,13 +657,13 @@ def _sb_select_history_rt(hours_back: int = 24 * 30) -> pd.DataFrame:
         return pd.DataFrame()
     return _scrape_enrich_df(df)
 
-def _latest_per_alias_table(df_master: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[datetime.datetime]]:
-    if df_master is None or df_master.empty:
+
+def _latest_per_alias_table(df_enriched: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[datetime.datetime]]:
+    """Primește df deja enriched (cu plant_uid, ts_local naive etc.)."""
+    if df_enriched is None or df_enriched.empty:
         return pd.DataFrame(columns=["Nume", "Putere (kW)", "Delay (min)"]), None
 
-    d = _scrape_enrich_df(df_master)
-    if d is None or d.empty:
-        return pd.DataFrame(columns=["Nume", "Putere (kW)", "Delay (min)"]), None
+    d = df_enriched 
 
     now_local_naive = (datetime.datetime.now(FS_TZ) + datetime.timedelta(minutes=FUTURE_TOL_MIN)).replace(tzinfo=None)
     d = d[d["ts_local"] <= now_local_naive].copy()
@@ -693,12 +699,13 @@ def _latest_per_alias_table(df_master: pd.DataFrame) -> Tuple[pd.DataFrame, Opti
 
     return view, snap_ts
 
-def _wide_total_15min(df_master: pd.DataFrame) -> pd.DataFrame:
-    if df_master is None or df_master.empty:
+
+def _wide_total_15min(df_enriched: pd.DataFrame) -> pd.DataFrame:
+    """Primește df deja enriched – fără re-enrichment."""
+    if df_enriched is None or df_enriched.empty:
         return pd.DataFrame()
-    d = _scrape_enrich_df(df_master)
-    if d.empty:
-        return pd.DataFrame()
+
+    d = df_enriched  
     now_local_naive = (datetime.datetime.now(FS_TZ) + datetime.timedelta(minutes=FUTURE_TOL_MIN)).replace(tzinfo=None)
     d = d[d["ts_local"] <= now_local_naive].copy()
     if d.empty:
@@ -880,9 +887,7 @@ def _render_export_section(df_rt: Optional[pd.DataFrame]):
 
     aliases: List[str] = []
     if df_rt is not None and not df_rt.empty:
-        d = _scrape_enrich_df(df_rt)
-        if not d.empty:
-            aliases = sorted(d["alias_name"].dropna().unique().tolist())
+        aliases = sorted(df_rt["alias_name"].dropna().unique().tolist())
     if not aliases:
         st.warning("Nu sunt centrale disponibile. Încarcă mai întâi datele din secțiunea Scraping.")
         return
@@ -1012,7 +1017,10 @@ def render_page():
     save_csv_rt = c2.button("Save CSV", key="btn_save_rt")
 
     if reload_rt or st.session_state.get("rt_hist_cache") is None:
-        st.session_state["rt_hist_cache"] = _sb_select_history_rt(hours_back=24*30)
+        with st.spinner("Se încarcă datele zilei..."):
+            st.session_state["rt_hist_cache"] = _sb_select_history_rt(
+                hours_back=RT_DEFAULT_HOURS_BACK
+            )
         st.session_state["rt_hist_last_load"] = _now_local_str()
 
     st.caption(f"Ultima încărcare RT: {st.session_state.get('rt_hist_last_load', '-')}")
@@ -1023,7 +1031,7 @@ def render_page():
     _render_rt_total_chart(df_rt, "Scraping")
 
     if save_csv_rt and df_rt is not None and not df_rt.empty:
-        out = _scrape_enrich_df(df_rt).copy()
+        out = df_rt.copy()
         out["ts_local_str"] = pd.to_datetime(out["ts_local"], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
         csv_hist = out[["ts_local_str", "alias_name", "power_kw", "plant_code", "plant_name", "instance_key"]].to_csv(index=False).encode("utf-8")
 
