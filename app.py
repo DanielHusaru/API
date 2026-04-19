@@ -718,6 +718,11 @@ def _wide_total_15min(df_enriched: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     idx_full = pd.date_range(wide_plant.index.min(), wide_plant.index.max(), freq="15min")
     wide_plant = wide_plant.reindex(idx_full).ffill().fillna(0.0)
+    last_real_ts = d.groupby("plant_uid")["ts_local"].max()
+    for col in wide_plant.columns:
+        if col in last_real_ts.index:
+            cutoff = last_real_ts[col] + pd.Timedelta(minutes=60)
+            wide_plant.loc[wide_plant.index > cutoff, col] = 0.0
     plant_to_alias = d.sort_values("ts_local").groupby("plant_uid")["alias_name"].last().to_dict()
     wide_plant = wide_plant.rename(columns={c: plant_to_alias.get(c, c) for c in wide_plant.columns})
     wide_alias = wide_plant.T.groupby(level=0).sum().T
