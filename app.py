@@ -739,10 +739,11 @@ def _render_rt_metrics_like_main(df_rt: pd.DataFrame, title: str = "Scraping –
     if view is None or view.empty:
         st.warning("Nu găsesc valori valide.")
         return
+    view=view[~view["Nume"].map(_is_excluded_name)].reset_index(drop=True)
     total = int(len(view))
     active_cnt = int((view["Putere (kW)"] > 0.0).sum())
     inactive_cnt = total - active_cnt
-    sum_kw = float(view.loc[~view["Nume"].map(_is_excluded_name), "Putere (kW)"].fillna(0.0).sum())
+    sum_kw = float(view["Putere (kW)"].fillna(0.0).sum())
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total", total)
     m2.metric("Active", active_cnt)
