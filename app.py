@@ -11,7 +11,7 @@ import fusion_api as fs
 import altair as alt
 
 FS_TZ = ZoneInfo("Europe/Bucharest")
-FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia", "mv_green", "q_solar", "united_power_trading", "vertical"]
+FS_SUM_EXCLUDE_NAME_CONTAINS = ["raal", "transavia", "q_solar", "united_power_trading", "vertical"]
 
 SB_TABLE_MAIN = "fs_power_snapshots"
 SB_TABLE_SCRAPE = "fs_power_master"
